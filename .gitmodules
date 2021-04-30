@@ -1,0 +1,3 @@
+[submodule "deps/x86"]
+	path = deps/x86
+	url = https://github.com/vktec/x86-zig

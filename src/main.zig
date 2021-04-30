@@ -6,7 +6,28 @@ const Token = union(enum) {
     int: i64,
 };
 
-fn compile(w: anytype, toks: []const Token) !void {
+const TokenIterator = struct {
+    toks: std.mem.TokenIterator,
+
+    pub fn init(expr: []const u8) TokenIterator {
+        return .{ .toks = std.mem.tokenize(expr, " \t\n") };
+    }
+
+    pub fn next(self: *TokenIterator) !?Token {
+        if (self.toks.next()) |tok| {
+            if (tok.len == 1 and std.mem.indexOf(u8, "+-*/", tok) != null) {
+                return Token{ .op = tok[0] };
+            } else {
+                const i = try std.fmt.parseInt(i64, tok, 0);
+                return Token{ .int = i };
+            }
+        } else {
+            return null;
+        }
+    }
+};
+
+fn compile(w: anytype, toks: *TokenIterator) !void {
     const m = x86.Machine.init(.x64);
 
     const rax = x86.Operand.register(.RAX);
@@ -26,7 +47,7 @@ fn compile(w: anytype, toks: []const Token) !void {
 
     var stackSize: u32 = 0;
 
-    for (toks) |tok| {
+    while (try toks.next()) |tok| {
         switch (tok) {
             .int => |x| {
                 {
@@ -84,6 +105,9 @@ fn compile(w: anytype, toks: []const Token) !void {
                     try w.writeAll(i.asSlice());
                 }
 
+                if (stackSize < 2) {
+                    return error.StackUnderflow;
+                }
                 stackSize -= 1;
             },
         }
@@ -121,7 +145,7 @@ const JitResult = struct {
     }
 };
 
-fn jit(toks: []const Token) !JitResult {
+fn jit(toks: *TokenIterator) !JitResult {
     const allocator = std.heap.page_allocator;
     // FIXME: use ArrayListAligned. See ziglang/zig#8647
     var buf = try std.ArrayList(u8).initCapacity(allocator, std.mem.page_size);
@@ -145,22 +169,34 @@ fn alignup(comptime T: type, x: T, a: T) T {
     return 1 +% ~(1 +% ~x & 1 +% ~a);
 }
 
-pub fn main() !void {
-    const toks = &[_]Token{
-        .{ .int = 1 },
-        .{ .int = 3 },
-        .{ .int = 4 },
-        .{ .op = '+' },
-        .{ .int = 2 },
-        .{ .op = '/' },
-        .{ .op = '+' },
-        .{ .int = 12 },
-        .{ .op = '*' },
-    };
-    const jitted = try jit(toks);
+fn printEval(expr: []const u8) !void {
+    var toks = TokenIterator.init(expr);
+    const jitted = try jit(&toks);
     defer jitted.deinit();
+
     const out = std.io.getStdOut().writer();
-    try out.print("compiled\n", .{});
-    const result = jitted.func();
-    try out.print("{}\n", .{result});
+    try out.print("{}\n", .{jitted.func()});
+}
+
+pub fn main() !void {
+    var args = std.process.args();
+    _ = args.skip();
+    if (args.nextPosix()) |arg| {
+        try printEval(arg);
+    } else {
+        var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+        const allocator = &gpa.allocator;
+
+        var buf = std.ArrayList(u8).init(allocator);
+        const in = std.io.getStdIn().reader();
+        while (true) {
+            in.readUntilDelimiterArrayList(&buf, '\n', 1 << 20) catch |err| {
+                if (err == error.EndOfStream) break;
+                return err;
+            };
+            printEval(buf.items) catch |err| {
+                try std.io.getStdErr().writer().print("{}\n", .{err});
+            };
+        }
+    }
 }

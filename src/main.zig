@@ -27,111 +27,103 @@ const TokenIterator = struct {
     }
 };
 
-fn compile(w: anytype, toks: *TokenIterator) !void {
-    const m = x86.Machine.init(.x64);
+fn Compiler(comptime Writer: type) type {
+    return struct {
+        w: Writer,
+        m: x86.Machine,
+        stackSize: u32 = 0,
 
-    const rax = x86.Operand.register(.RAX);
-    const rdi = x86.Operand.register(.RDI);
-    const rbp = x86.Operand.register(.RBP);
-    const rsp = x86.Operand.register(.RSP);
+        const Self = @This();
 
-    // Prelude
-    {
-        const i = try m.build1(.PUSH, rbp);
-        try w.writeAll(i.asSlice());
-    }
-    {
-        const i = try m.build2(.MOV, rbp, rsp);
-        try w.writeAll(i.asSlice());
-    }
-
-    var stackSize: u32 = 0;
-
-    while (try toks.next()) |tok| {
-        switch (tok) {
-            .int => |x| {
-                {
-                    const val = x86.Operand.immediateSigned64(x);
-                    const i = try m.build2(.MOV, rax, val);
-                    try w.writeAll(i.asSlice());
-                }
-                {
-                    const i = try m.build1(.PUSH, rax);
-                    try w.writeAll(i.asSlice());
-                }
-                stackSize += 1;
-            },
-
-            .op => |operator| {
-                {
-                    const i = try m.build1(.POP, rdi);
-                    try w.writeAll(i.asSlice());
-                }
-                {
-                    const i = try m.build1(.POP, rax);
-                    try w.writeAll(i.asSlice());
-                }
-
-                switch (operator) {
-                    '+' => {
-                        const i = try m.build2(.ADD, rax, rdi);
-                        try w.writeAll(i.asSlice());
-                    },
-                    '-' => {
-                        const i = try m.build2(.SUB, rax, rdi);
-                        try w.writeAll(i.asSlice());
-                    },
-                    '*' => {
-                        const i = try m.build2(.IMUL, rax, rdi);
-                        try w.writeAll(i.asSlice());
-                    },
-
-                    '/' => {
-                        {
-                            const i = try m.build0(.CDQ);
-                            try w.writeAll(i.asSlice());
-                        }
-                        {
-                            const i = try m.build1(.IDIV, rdi);
-                            try w.writeAll(i.asSlice());
-                        }
-                    },
-
-                    else => return error.InvalidOperator,
-                }
-
-                {
-                    const i = try m.build1(.PUSH, rax);
-                    try w.writeAll(i.asSlice());
-                }
-
-                if (stackSize < 2) {
-                    return error.StackUnderflow;
-                }
-                stackSize -= 1;
-            },
+        // Create a new compiler that will output machine code to the provided writer
+        pub fn init(w: Writer) !Self {
+            const self = Self{
+                .w = w,
+                .m = x86.Machine.init(.x64),
+            };
+            try self.begin();
+            return self;
         }
-    }
 
-    if (stackSize < 1) {
-        return error.StackUnderflow;
-    } else if (stackSize > 1) {
-        return error.UnusedOperands;
-    }
+        const rax = x86.Operand.register(.RAX);
+        const rdi = x86.Operand.register(.RDI);
+        const rbp = x86.Operand.register(.RBP);
+        const rsp = x86.Operand.register(.RSP);
 
-    // Teardown
-    {
-        const i = try m.build1(.POP, rax);
-        try w.writeAll(i.asSlice());
+        // Emit a single instruction
+        fn emit(self: Self, mnem: x86.Mnemonic, operands: anytype) !void {
+            var ops = [5]?*const x86.Operand{ null, null, null, null, null };
+            for (@as([operands.len]x86.Operand, operands)) |*op, i| {
+                ops[i] = op;
+            }
+            const insn = try self.m.build(null, mnem, ops[0], ops[1], ops[2], ops[3], ops[4]);
+            try self.w.writeAll(insn.asSlice());
+        }
+
+        // Emit the function prelude instructions
+        fn begin(self: Self) !void {
+            try self.emit(.PUSH, .{rbp});
+            try self.emit(.MOV, .{ rbp, rsp });
+        }
+
+        // Emit the function teardown and finish the compilation
+        pub fn finish(self: Self) !void {
+            if (self.stackSize < 1) {
+                return error.StackUnderflow;
+            } else if (self.stackSize > 1) {
+                return error.UnusedOperands;
+            }
+
+            try self.emit(.POP, .{rax});
+            try self.emit(.LEAVE, .{});
+            try self.emit(.RET, .{});
+        }
+
+        // Emit the instructions for a given token
+        pub fn compile(self: *Self, tok: Token) !void {
+            switch (tok) {
+                .int => |x| {
+                    const val = x86.Operand.immediateSigned64(x);
+                    try self.emit(.MOV, .{ rax, val });
+                    try self.emit(.PUSH, .{rax});
+                    self.stackSize += 1;
+                },
+
+                .op => |operator| {
+                    try self.emit(.POP, .{rdi});
+                    try self.emit(.POP, .{rax});
+
+                    switch (operator) {
+                        '+' => try self.emit(.ADD, .{ rax, rdi }),
+                        '-' => try self.emit(.SUB, .{ rax, rdi }),
+                        '*' => try self.emit(.IMUL, .{ rax, rdi }),
+
+                        '/' => {
+                            try self.emit(.CDQ, .{});
+                            try self.emit(.IDIV, .{rdi});
+                        },
+
+                        else => return error.InvalidOperator,
+                    }
+
+                    try self.emit(.PUSH, .{rax});
+
+                    if (self.stackSize < 2) {
+                        return error.StackUnderflow;
+                    }
+                    self.stackSize -= 1;
+                },
+            }
+        }
+    };
+}
+
+fn compile(w: anytype, toks: *TokenIterator) !void {
+    var compiler = try Compiler(@TypeOf(w)).init(w);
+    while (try toks.next()) |tok| {
+        try compiler.compile(tok);
     }
-    {
-        const i = try m.build0(.LEAVE);
-        try w.writeAll(i.asSlice());
-    }
-    {
-        const i = try m.build0(.RET);
-        try w.writeAll(i.asSlice());
-    }
+    try compiler.finish();
 }
 
 const JitResult = struct {
